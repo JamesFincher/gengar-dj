@@ -1,0 +1,4 @@
+Place your pre-downloaded lofi MP3 files here.
+
+The bot scans this directory on startup and adds tracks to the
+radio rotation. File naming convention: "Artist - Title.mp3"

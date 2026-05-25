@@ -1,0 +1,21 @@
+# ─── Gengar DJ — k3s Service ────────────────────────────────────
+# Exposes the internal API and health check on the cluster network.
+# Also includes a Tailscale sidecar for direct MagicDNS access.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gengar-dj-bot
+  namespace: gengar-lab
+  labels:
+    app: gengar-dj
+  annotations:
+    tailscale.com/experimental: "true"
+spec:
+  selector:
+    app: gengar-dj
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP

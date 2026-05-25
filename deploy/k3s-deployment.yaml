@@ -1,0 +1,167 @@
+# ─── Gengar DJ — k3s Deployment ─────────────────────────────────
+# Runs the Discord bot with a Tailscale sidecar for MagicDNS access.
+# The bot needs:
+#   - PersistentVolume for song storage (shared between pods)
+#   - Tailscale sidecar for first-class tailnet device
+#   - HostNetwork access to reach the Hermes webhook on the host
+---
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gengar-dj-songs-pvc
+  namespace: gengar-lab
+  labels:
+    app: gengar-dj
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gengar-dj
+  namespace: gengar-lab
+  labels:
+    app: gengar-dj
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # only one voice connection possible at a time
+  selector:
+    matchLabels:
+      app: gengar-dj
+  template:
+    metadata:
+      labels:
+        app: gengar-dj
+        tailscale.com/proxy: "true"
+    spec:
+      # Pin to gengar-claw-01 so we can reach the Hermes webhook on the host
+      nodeSelector:
+        kubernetes.io/hostname: gengar-claw-01
+
+      # ── Tailscale sidecar container ────────────────────────
+      initContainers:
+        - name: ts-init
+          image: tailscale/tailscale:latest
+          command: ["sh", "-c", "exit 0"]
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+            privileged: true
+
+      containers:
+        - name: tailscale
+          image: tailscale/tailscale:latest
+          env:
+            - name: TS_USERSPACE
+              value: "false"
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: tailscale-auth
+                  key: authkey
+                  optional: true
+            - name: TS_HOSTNAME
+              value: "gengar-dj"
+            - name: TS_STATE_DIR
+              value: "/var/lib/tailscale"
+            - name: TS_EXTRA_ARGS
+              value: "--accept-routes --advertise-tags=tag:k3s-service"
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+            privileged: false
+
+        # ── Main bot container ────────────────────────────────
+        - name: bot
+          image: ghcr.io/jamesfincher/gengar-dj:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: api
+          env:
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gengar-dj-secrets
+                  key: DISCORD_BOT_TOKEN
+            - name: HERMES_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gengar-dj-secrets
+                  key: HERMES_WEBHOOK_SECRET
+            - name: HERMES_WEBHOOK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: HERMES_WEBHOOK_URL
+            - name: BOT_API_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: BOT_API_HOST
+            - name: BOT_API_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: BOT_API_PORT
+            - name: SONGS_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: SONGS_DIR
+            - name: PLAYLIST_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: PLAYLIST_FILE
+            - name: SILENCE_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: SILENCE_THRESHOLD
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: gengar-dj-config
+                  key: LOG_LEVEL
+            - name: BOT_CALLBACK_URL
+              value: "http://gengar-dj-bot.gengar-lab.svc.cluster.local:8080"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: api
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: songs
+              mountPath: /data
+
+      volumes:
+        - name: songs
+          persistentVolumeClaim:
+            claimName: gengar-dj-songs-pvc
+        - name: tailscale-state
+          emptyDir: {}

@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.mp3
+!songs/*.mp3
+.DS_Store
+bot/config_local.py
