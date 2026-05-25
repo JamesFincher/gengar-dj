@@ -116,6 +116,7 @@ class RadioState:
         self.duck_volume: float = 0.12     # volume when people talk (12%)
         self.fade_back_seconds: float = 4.0  # seconds to ramp back to full volume
         self._fade_task: asyncio.Task | None = None
+        self._fade_out_task: asyncio.Task | None = None  # end-of-track crossfade
 
         # Cloudflare R2 client
         self.s3_client = bot.s3_client
@@ -174,6 +175,14 @@ class RadioState:
         if self._radio_task:
             self._radio_task.cancel()
             self._radio_task = None
+
+        if self._fade_task and not self._fade_task.done():
+            self._fade_task.cancel()
+            self._fade_task = None
+
+        if self._fade_out_task and not self._fade_out_task.done():
+            self._fade_out_task.cancel()
+            self._fade_out_task = None
 
         if self.sink:
             try:
@@ -257,7 +266,8 @@ class RadioState:
                             "title": title,
                             "file": key,
                             "style_tags": style_tags,
-                            "source": meta.get("source") or "r2"
+                            "source": meta.get("source") or "r2",
+                            "duration": meta.get("duration"),  # seconds, from ffprobe
                         })
         except Exception as e:
             logger.error("Failed to list objects in Cloudflare R2: %s", e)
@@ -361,6 +371,33 @@ class RadioState:
         except Exception as e:
             logger.warning("Fade-back error: %s", e)
 
+    async def _schedule_fade_out(self, duration: float):
+        """Fade volume out over the last 3 seconds of a track.
+        
+        Creates an iOS-style crossfade: this track fades out while
+        the next track (with 3s fade-in) starts, blending them together.
+        """
+        try:
+            # Wait until 3.5s before the track ends, then fade over 2.5s
+            wait_time = max(0, duration - 3.5)
+            await asyncio.sleep(wait_time)
+            if not self.playing or not self.vc or not self.vc.source:
+                return
+            # Ramp volume down from current to ~5% over 2.5s
+            steps = 15
+            delay = 2.5 / steps
+            start_vol = self.volume
+            for i in range(steps):
+                if not self.playing or not self.vc or not self.vc.source:
+                    return
+                target = start_vol * (1.0 - (i + 1) / steps)
+                self.vc.source.volume = max(0.03, target)
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Fade-out error: %s", e)
+
     async def _on_silence_start(self):
         """Called when silence begins after speaking stopped."""
         pass
@@ -416,6 +453,13 @@ class RadioState:
 
             self.vc.play(volume_source, after=after_playing)
             logger.info("Now playing from R2: %s", entry["title"])
+
+            # Schedule crossfade: fade out last 3s of this track
+            duration = entry.get("duration")
+            if duration and duration > 6:
+                self._fade_out_task = asyncio.create_task(
+                    self._schedule_fade_out(duration)
+                )
 
         except Exception as e:
             logger.error("Failed to play %s from R2: %s", key, e)
