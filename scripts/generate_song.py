@@ -357,19 +357,54 @@ def main():
         print(f"[Gengar DJ Generator] Error downloading track: {e}")
         sys.exit(1)
 
+    # 4. Upload to Cloudflare R2
+    file_key = f"songs/{primary_clip_id}.mp3"
+    print(f"[Gengar DJ Generator] Uploading song to Cloudflare R2: {file_key} ...")
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        
+        r2_account_id = os.environ.get("R2_ACCOUNT_ID")
+        r2_access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
+        r2_secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+        r2_bucket_name = os.environ.get("R2_BUCKET_NAME")
+        
+        if not all([r2_account_id, r2_access_key_id, r2_secret_access_key, r2_bucket_name]):
+            raise Exception("Missing required Cloudflare R2 environment variables for upload.")
+            
+        endpoint = f"https://{r2_account_id}.r2.cloudflarestorage.com"
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=r2_access_key_id,
+            aws_secret_access_key=r2_secret_access_key,
+            config=BotoConfig(signature_version="s3v4")
+        )
+        
+        s3.upload_file(
+            Filename=local_path,
+            Bucket=r2_bucket_name,
+            Key=file_key,
+            ExtraArgs={"ContentType": "audio/mpeg"}
+        )
+        print("[Gengar DJ Generator] Upload to R2 completed successfully!")
+    except Exception as r2_err:
+        print(f"[Gengar DJ Generator] Error uploading to Cloudflare R2: {r2_err}")
+        sys.exit(1)
+
+    # Clean up local temporary file
+    try:
+        os.remove(local_path)
+    except Exception:
+        pass
+
     # 5. POST back to the Discord bot's callback API
-    # We post using multipart/form-data or JSON with download_url. 
-    # Let's post the JSON containing download_url, which is easiest and cleanest!
-    # Wait, the bot APIServer handles "download_url" and downloads it natively,
-    # or accepts "file_path" if on a shared volume.
-    # Since they run in the same host/K8s/homelab environment, let's pass both so the bot can choose!
     callback_payload = {
         "guild_id": args.guild_id,
         "channel_id": args.channel_id,
         "user_id": args.user_id,
         "title": clip.get("title", args.title),
-        "file_path": local_path,
-        "download_url": audio_url,
+        "file_key": file_key,
         "play_in_vc": args.play_in_vc,
         "style_tags": style_tags
     }

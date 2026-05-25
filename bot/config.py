@@ -27,7 +27,14 @@ class Config:
     bot_api_port: int = 8080
     bot_callback_url: str = "http://localhost:8080"
 
-    # Song library
+    # Cloudflare R2 Config
+    r2_account_id: str
+    r2_access_key_id: str
+    r2_secret_access_key: str
+    r2_bucket_name: str
+    r2_public_url: str = ""  # e.g., https://pub-xxx.r2.dev or custom domain
+
+    # Song library (local cache, used if R2 is slow or during download transitions)
     songs_dir: str = "/data/songs"
     playlist_file: str = "/data/playlist.json"
 
@@ -56,6 +63,14 @@ class Config:
             "BOT_CALLBACK_URL",
             "http://gengar-dj-bot.gengar-lab.svc.cluster.local:8080",
         )
+        
+        # Cloudflare R2 Config
+        self.r2_account_id = self._req("R2_ACCOUNT_ID")
+        self.r2_access_key_id = self._req("R2_ACCESS_KEY_ID")
+        self.r2_secret_access_key = self._req("R2_SECRET_ACCESS_KEY")
+        self.r2_bucket_name = self._req("R2_BUCKET_NAME")
+        self.r2_public_url = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+
         self.songs_dir = os.environ.get("SONGS_DIR", "/data/songs")
         self.playlist_file = os.environ.get(
             "PLAYLIST_FILE", "/data/playlist.json"

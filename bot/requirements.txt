@@ -2,3 +2,4 @@ discord.py[voice]==2.5.0
 aiohttp>=3.9.0
 numpy>=1.24.0
 mutagen>=1.47.0
+boto3>=1.34.0

@@ -1,7 +1,7 @@
 """Internal HTTP API server for Gengar DJ.
 
-Handles song creation callbacks from Hermes/Gengar and file uploads.
-Runs as an async aiohttp server alongside the Discord bot.
+Handles song creation callbacks from Hermes/Gengar and playlist management.
+All metadata is preserved directly on Cloudflare R2.
 """
 
 import asyncio
@@ -15,6 +15,8 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+import boto3
+from botocore.config import Config as BotoConfig
 
 logger = logging.getLogger("gengar_dj.api")
 
@@ -28,10 +30,10 @@ class APIServer:
         self._app = web.Application()
         self._runner: web.AppRunner | None = None
         self._setup_routes()
+        self.s3_client = bot.s3_client
 
     def _setup_routes(self):
         self._app.router.add_post("/api/callback/song", self.handle_song_callback)
-        self._app.router.add_post("/api/upload", self.handle_upload)
         self._app.router.add_get("/api/health", self.handle_health)
         self._app.router.add_get("/api/playlist", self.handle_get_playlist)
         self._app.router.add_post("/api/playlist/add", self.handle_add_to_playlist)
@@ -63,7 +65,7 @@ class APIServer:
         return web.json_response({"status": "ok", "guilds": len(self.bot.guilds)})
 
     async def handle_song_callback(self, request):
-        """Receive completed song from Hermes/Gengar after /create.
+        """Receive completed song from Gengar after /create.
 
         Expected JSON payload:
         {
@@ -71,8 +73,7 @@ class APIServer:
             "channel_id": int,
             "user_id": int,
             "title": str,
-            "file_path": str,       // path to MP3 file on shared volume or
-            "download_url": str,    // URL the bot can fetch to download
+            "file_key": str,         // R2 object key of the uploaded song
             "play_in_vc": bool,
             "style_tags": str (optional)
         }
@@ -85,47 +86,30 @@ class APIServer:
         guild_id = data.get("guild_id")
         channel_id = data.get("channel_id")
         title = data.get("title", "Untitled")
-        file_path = data.get("file_path")
-        download_url = data.get("download_url")
+        file_key = data.get("file_key")
         play_in_vc = data.get("play_in_vc", False)
         style_tags = data.get("style_tags", "")
 
-        if not guild_id or not channel_id:
-            return web.json_response({"error": "guild_id and channel_id required"}, status=400)
+        if not guild_id or not channel_id or not file_key:
+            return web.json_response(
+                {"error": "guild_id, channel_id, and file_key required"},
+                status=400
+            )
 
-        # Determine song path
-        song_path = file_path
-        if download_url and not song_path:
-            # Download the file
-            song_path = await self._download_song(download_url, title)
-            if not song_path:
-                return web.json_response({"error": "failed to download song"}, status=502)
+        logger.info("Received callback for fresh Suno track: %s (key: %s)", title, file_key)
 
-        if not song_path or not os.path.isfile(song_path):
-            return web.json_response({"error": f"song file not found: {song_path}"}, status=400)
-
-        # Copy or move to songs dir
-        songs_dir = Path(self.config.songs_dir)
-        songs_dir.mkdir(parents=True, exist_ok=True)
-        dest = songs_dir / f"{uuid.uuid4().hex[:8]} - {self._sanitize_filename(title)}.mp3"
-        import shutil
-        shutil.copy2(song_path, dest)
-        logger.info("Copied new song to library: %s", dest)
-
-        # Add to playlist
-        playlist = self._load_playlist()
+        # Add to R2 playlist.json
         entry = {
             "id": uuid.uuid4().hex[:12],
             "title": title,
-            "file": str(dest),
+            "file": file_key,
             "style_tags": style_tags,
             "source": "suno",
             "created_at": asyncio.get_event_loop().time(),
         }
-        playlist.append(entry)
-        self._save_playlist(playlist)
+        await asyncio.to_thread(self._append_to_r2_playlist_sync, entry)
 
-        # Send message to Discord channel
+        # Send notification to Discord channel
         guild = self.bot.get_guild(guild_id)
         channel = guild.get_channel(channel_id) if guild else None
         if channel:
@@ -136,67 +120,46 @@ class APIServer:
             )
             if style_tags:
                 embed.add_field(name="Style", value=f"```{style_tags[:200]}```", inline=False)
-            embed.set_footer(text="Gengar DJ • Suno Generator")
+            embed.set_footer(text="Gengar DJ • Suno R2 Engine")
             await channel.send(embed=embed)
 
-        # Optionally play in voice channel
+        # Optionally play in voice channel immediately
         if play_in_vc and guild_id in self.bot.radio_states:
             state = self.bot.radio_states[guild_id]
             if state.vc and state.vc.is_connected():
-                await state.queue_song(str(dest), title)
+                await state.queue_song(file_key, title)
 
-        return web.json_response({"status": "ok", "song_id": entry["id"], "file": str(dest)})
-
-    async def handle_upload(self, request):
-        """Accept MP3 file upload from Hermes webhook."""
-        reader = await request.multipart()
-        field = await reader.next()
-        if not field or field.name != "file":
-            return web.json_response({"error": "missing 'file' field"}, status=400)
-
-        songs_dir = Path(self.config.songs_dir)
-        songs_dir.mkdir(parents=True, exist_ok=True)
-        filename = field.filename or f"{uuid.uuid4().hex}.mp3"
-        dest = songs_dir / self._sanitize_filename(filename)
-
-        with open(dest, "wb") as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-
-        logger.info("Uploaded song: %s (%d bytes)", dest, dest.stat().st_size)
-        return web.json_response({"status": "ok", "file": str(dest)})
+        return web.json_response({"status": "ok", "song_id": entry["id"], "key": file_key})
 
     async def handle_get_playlist(self, request):
-        playlist = self._load_playlist()
+        """Fetch the current playlist from R2."""
+        playlist = await asyncio.to_thread(self._load_r2_playlist_sync)
         return web.json_response(playlist)
 
     async def handle_add_to_playlist(self, request):
+        """Add manual metadata / existing R2 file to R2 playlist."""
         try:
             data = await request.json()
         except json.JSONDecodeError:
             return web.json_response({"error": "invalid JSON"}, status=400)
 
-        file_path = data.get("file")
-        title = data.get("title", os.path.basename(file_path or "unknown"))
-        if not file_path or not os.path.isfile(file_path):
-            return web.json_response({"error": "file not found"}, status=400)
+        file_key = data.get("file")
+        title = data.get("title", os.path.basename(file_key or "unknown"))
+        if not file_key:
+            return web.json_response({"error": "file (key) required"}, status=400)
 
-        playlist = self._load_playlist()
         entry = {
             "id": uuid.uuid4().hex[:12],
             "title": title,
-            "file": file_path,
+            "file": file_key,
             "source": "manual",
             "created_at": asyncio.get_event_loop().time(),
         }
-        playlist.append(entry)
-        self._save_playlist(playlist)
+        await asyncio.to_thread(self._append_to_r2_playlist_sync, entry)
         return web.json_response({"status": "ok", "id": entry["id"]})
 
     async def handle_remove_from_playlist(self, request):
+        """Remove metadata entry from playlist.json on R2."""
         try:
             data = await request.json()
         except json.JSONDecodeError:
@@ -206,58 +169,45 @@ class APIServer:
         if not song_id:
             return web.json_response({"error": "id required"}, status=400)
 
-        playlist = self._load_playlist()
-        playlist[:] = [s for s in playlist if s.get("id") != song_id]
-        self._save_playlist(playlist)
+        await asyncio.to_thread(self._remove_from_r2_playlist_sync, song_id)
         return web.json_response({"status": "ok"})
 
-    # ─── helpers ────────────────────────────────────────────────
+    # ─── sync-to-thread R2 operations ─────────────────────────────
 
-    def _load_playlist(self) -> list:
-        path = Path(self.config.playlist_file)
-        if path.exists():
-            try:
-                return json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                logger.warning("Corrupt playlist file, starting fresh")
-        return []
-
-    def _save_playlist(self, playlist: list):
-        path = Path(self.config.playlist_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(playlist, indent=2))
-
-    def _sanitize_filename(self, name: str) -> str:
-        """Strip or replace characters that are problematic in filenames."""
-        keep = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ")
-        return "".join(c if c in keep else "_" for c in name).strip("._")
-
-    async def _download_song(self, url: str, title: str) -> str | None:
-        """Download a song from a URL into the songs directory."""
-        songs_dir = Path(self.config.songs_dir)
-        songs_dir.mkdir(parents=True, exist_ok=True)
-        dest = songs_dir / f"{uuid.uuid4().hex[:8]} - {self._sanitize_filename(title)}.mp3"
-
+    def _load_r2_playlist_sync(self) -> list:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                    if resp.status != 200:
-                        logger.error("Download failed: HTTP %d for %s", resp.status, url)
-                        return None
-                    with open(dest, "wb") as f:
-                        while True:
-                            chunk = await resp.content.read(8192)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-            logger.info("Downloaded song: %s", dest)
-            return str(dest)
+            res = self.s3_client.get_object(
+                Bucket=self.config.r2_bucket_name,
+                Key="playlist.json"
+            )
+            return json.loads(res["Body"].read().decode("utf-8"))
+        except self.s3_client.exceptions.NoSuchKey:
+            return []
         except Exception as e:
-            logger.error("Download error for %s: %s", url, e)
-            # Clean up partial download
-            if dest.exists():
-                dest.unlink()
-            return None
+            logger.warning("Error reading playlist.json from R2: %s", e)
+            return []
+
+    def _append_to_r2_playlist_sync(self, entry: dict):
+        playlist = self._load_r2_playlist_sync()
+        playlist.append(entry)
+        self._save_r2_playlist_sync(playlist)
+
+    def _remove_from_r2_playlist_sync(self, song_id: str):
+        playlist = self._load_r2_playlist_sync()
+        playlist[:] = [s for s in playlist if s.get("id") != song_id]
+        self._save_r2_playlist_sync(playlist)
+
+    def _save_r2_playlist_sync(self, playlist: list):
+        try:
+            self.s3_client.put_object(
+                Bucket=self.config.r2_bucket_name,
+                Key="playlist.json",
+                Body=json.dumps(playlist, indent=2).encode("utf-8"),
+                ContentType="application/json"
+            )
+            logger.info("Saved updated playlist.json to Cloudflare R2")
+        except Exception as e:
+            logger.error("Failed to write playlist.json to R2: %s", e)
 
 
 # Make discord available for embed creation

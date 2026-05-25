@@ -10,11 +10,8 @@ metadata:
 data:
   BOT_API_HOST: "0.0.0.0"
   BOT_API_PORT: "8080"
-  SONGS_DIR: "/data/songs"
-  PLAYLIST_FILE: "/data/playlist.json"
   SILENCE_THRESHOLD: "25"
-  FADE_DURATION: "3"
   LOG_LEVEL: "INFO"
   # Points to the Hermes webhook running on the host node
   # gengar-claw-01's IP is 100.70.184.45 on Tailscale — use that
-  HERMES_WEBHOOK_URL: "http://100.70.184.45:8644/webhook/gengar-dj-create"
+  HERMES_WEBHOOK_URL: "http://100.70.184.45:8644/webhooks/gengar-dj-create"

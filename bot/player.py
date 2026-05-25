@@ -1,8 +1,8 @@
 """Gengar DJ — Audio player and silence detection engine.
 
 Uses discord.py's VoiceClient with AudioSink for real-time
-voice energy monitoring. When silence exceeds the threshold,
-the player starts shuffling through the lofi playlist.
+voice energy monitoring. Plays lofi tracks directly from
+Cloudflare R2 when the voice channel goes quiet.
 """
 
 import asyncio
@@ -13,9 +13,12 @@ import os
 import random
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import discord
 import numpy as np
+import boto3
+from botocore.config import Config as BotoConfig
 
 logger = logging.getLogger("gengar_dj.player")
 
@@ -93,6 +96,9 @@ class RadioState:
         # Volume (0.0 - 2.0)
         self.volume: float = 0.6
 
+        # Cloudflare R2 client
+        self.s3_client = bot.s3_client
+
     async def start_radio(self, voice_channel: discord.VoiceChannel):
         """Join a VC and begin silence monitoring."""
         try:
@@ -115,8 +121,8 @@ class RadioState:
         )
         self.vc.listen(self.sink)
 
-        # Load playlist
-        self._load_queue()
+        # Load playlist from R2
+        await self._load_queue()
 
         # Start the radio loop
         self._radio_task = asyncio.create_task(self._radio_loop())
@@ -152,10 +158,14 @@ class RadioState:
             return False
         return self.active  # call start_radio separately
 
-    async def queue_song(self, file_path: str, title: str):
+    async def queue_song(self, file_key: str, title: str):
         """Queue a new song immediately (for /create responses)."""
-        entry = {"file": file_path, "title": title}
-        self.queue.append(entry)
+        entry = {
+            "file": file_key,
+            "title": title,
+            "source": "suno_fresh"
+        }
+        self.queue.insert(0, entry)  # Insert at front of queue to play next!
         if not self.playing and self.vc and self.vc.is_connected():
             await self._play_next()
 
@@ -166,37 +176,59 @@ class RadioState:
 
     # ─── internal ───────────────────────────────────────────────
 
-    def _load_queue(self):
-        """Load all songs from the songs directory into the queue."""
-        songs_dir = Path(self.bot.config.songs_dir)
-        playlist_file = Path(self.bot.config.playlist_file)
+    async def _load_queue(self):
+        """Load songs from Cloudflare R2 bucket."""
+        await asyncio.to_thread(self._load_queue_sync)
 
-        # Load playlist entries first
+    def _load_queue_sync(self):
+        """Synchronous part of queue loading (run in thread to prevent blocking)."""
+        logger.info("Syncing lofi library from Cloudflare R2 bucket: %s", self.bot.config.r2_bucket_name)
         entries = []
-        if playlist_file.exists():
-            try:
-                data = json.loads(playlist_file.read_text())
-                for entry in data:
-                    fp = entry.get("file", "")
-                    if os.path.isfile(fp):
-                        entries.append(entry)
-                    else:
-                        logger.warning("Playlist entry missing file: %s", fp)
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Could not load playlist: %s", e)
+        playlist_data = []
 
-        # Fall back to scanning songs directory
-        if not entries and songs_dir.exists():
-            for f in sorted(songs_dir.iterdir()):
-                if f.suffix.lower() in (".mp3", ".ogg", ".wav", ".flac"):
-                    entries.append({
-                        "id": f.stem,
-                        "title": f.stem,
-                        "file": str(f),
-                        "source": "local",
-                    })
+        # 1. Attempt to load playlist.json from R2
+        try:
+            res = self.s3_client.get_object(
+                Bucket=self.bot.config.r2_bucket_name,
+                Key="playlist.json"
+            )
+            playlist_data = json.loads(res["Body"].read().decode("utf-8"))
+            logger.info("Loaded metadata playlist.json from R2 (%d items)", len(playlist_data))
+        except self.s3_client.exceptions.NoSuchKey:
+            logger.info("playlist.json not found in R2. Scanning bucket dynamically...")
+        except Exception as e:
+            logger.warning("Error reading playlist.json from R2: %s", e)
 
-        # Apply genre filter
+        # Build lookup table for metadata from playlist_data list
+        metadata_map = {}
+        for item in playlist_data:
+            key = item.get("file") or item.get("key")
+            if key:
+                metadata_map[key] = item
+
+        # 2. Scan all audio files in the bucket
+        try:
+            paginator = self.s3_client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bot.config.r2_bucket_name):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.lower().endswith((".mp3", ".ogg", ".wav", ".flac")) and key != "playlist.json":
+                        # Match with metadata if present
+                        meta = metadata_map.get(key) or {}
+                        title = meta.get("title") or os.path.splitext(os.path.basename(key))[0]
+                        style_tags = meta.get("style_tags") or meta.get("tags") or ""
+
+                        entries.append({
+                            "id": key,
+                            "title": title,
+                            "file": key,
+                            "style_tags": style_tags,
+                            "source": meta.get("source") or "r2"
+                        })
+        except Exception as e:
+            logger.error("Failed to list objects in Cloudflare R2: %s", e)
+
+        # Apply genre filter if active
         if self.genre_filter:
             filtered = []
             for e in entries:
@@ -210,7 +242,7 @@ class RadioState:
             random.shuffle(self.queue)
 
         logger.info(
-            "Loaded %d songs into queue (genre filter: %s)",
+            "Loaded %d R2 tracks into rotation queue (filter: %s)",
             len(self.queue),
             self.genre_filter or "none",
         )
@@ -255,28 +287,42 @@ class RadioState:
     async def _play_next(self):
         """Play the next song from the queue."""
         if not self.queue:
-            self._load_queue()
+            await self._load_queue()
         if not self.queue:
             logger.warning("No songs in queue for guild %d", self.guild_id)
             return
 
         self.playing = True
         entry = self.queue.pop(0)
+        
         # Re-queue for cycling (unless it was a fresh /create song)
         if entry.get("source") != "suno_fresh":
             self.queue.append(entry)
 
         self.current_song = entry
-        file_path = entry["file"]
+        key = entry["file"]
 
-        if not os.path.isfile(file_path):
-            logger.warning("Song file not found: %s", file_path)
+        # 3. Generate streaming URL
+        try:
+            if self.bot.config.r2_public_url:
+                encoded_key = quote(key)
+                play_url = f"{self.bot.config.r2_public_url}/{encoded_key}"
+            else:
+                # Generate a secure pre-signed URL valid for 1 hour
+                play_url = await asyncio.to_thread(
+                    self.s3_client.generate_presigned_url,
+                    "get_object",
+                    Params={"Bucket": self.bot.config.r2_bucket_name, "Key": key},
+                    ExpiresIn=3600,
+                )
+        except Exception as e:
+            logger.error("Failed to generate streaming URL for key %s: %s", key, e)
             self.playing = False
             return
 
         try:
             source = discord.FFmpegPCMAudio(
-                file_path,
+                play_url,
                 options="-filter:a loudnorm",
                 before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             )
@@ -290,10 +336,10 @@ class RadioState:
                 asyncio.run_coroutine_threadsafe(coro, asyncio.get_event_loop())
 
             self.vc.play(volume_source, after=after_playing)
-            logger.info("Now playing: %s", entry["title"])
+            logger.info("Now playing from R2: %s", entry["title"])
 
         except Exception as e:
-            logger.error("Failed to play %s: %s", file_path, e)
+            logger.error("Failed to play %s from R2: %s", key, e)
             self.playing = False
 
     async def _on_track_end(self):

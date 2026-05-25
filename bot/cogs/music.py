@@ -5,6 +5,7 @@ Gengar to generate a Suno lofi track. The result is delivered back
 via the internal API callback.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -162,23 +163,20 @@ class MusicCog(commands.Cog):
         description="Show the current song playlist",
     )
     async def show_playlist(self, interaction: discord.Interaction):
-        from ..api import APIServer
-        # Playlist is managed by the API server, but we can read it directly
         import json
-        from pathlib import Path
-        pl = Path(self.bot.config.playlist_file)
-        if not pl.exists():
-            await interaction.response.send_message(
-                "||The playlist is empty. Use /create to make some songs!||",
-                ephemeral=True,
-            )
-            return
-
         try:
-            entries = json.loads(pl.read_text())
-        except (json.JSONDecodeError, OSError):
+            res = await asyncio.to_thread(
+                self.bot.s3_client.get_object,
+                Bucket=self.bot.config.r2_bucket_name,
+                Key="playlist.json"
+            )
+            entries = json.loads(res["Body"].read().decode("utf-8"))
+        except self.bot.s3_client.exceptions.NoSuchKey:
+            entries = []
+        except Exception as e:
+            logger.error("Failed to load R2 playlist: %s", e)
             await interaction.response.send_message(
-                "||The playlist file is corrupted.||", ephemeral=True
+                "||Failed to load playlist from Cloudflare R2.||", ephemeral=True
             )
             return
 

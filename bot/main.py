@@ -1,8 +1,7 @@
 """Gengar DJ — Main entry point.
 
 A Discord bot that runs a silence-activated lofi radio in voice channels.
-Songs can be Suno-generated lofi tracks from Hayden's library or created
-on-the-fly via the /create slash command (routed through Hermes/Gengar).
+All tracks and metadata are preserved directly on Cloudflare R2.
 """
 
 import asyncio
@@ -12,6 +11,8 @@ import sys
 
 import discord
 from discord.ext import commands
+import boto3
+from botocore.config import Config as BotoConfig
 
 from .config import Config
 from .api import APIServer
@@ -43,6 +44,21 @@ class GengarDJ(commands.Bot):
         # {guild_id: RadioState}
         self.radio_states: dict[int, "RadioState"] = {}
 
+        # Initialize the global Cloudflare R2 Client
+        self._init_r2_client()
+
+    def _init_r2_client(self):
+        """Initialize the boto3 Cloudflare R2 client."""
+        endpoint = f"https://{self.config.r2_account_id}.r2.cloudflarestorage.com"
+        self.s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=self.config.r2_access_key_id,
+            aws_secret_access_key=self.config.r2_secret_access_key,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+        logger.info("Central Cloudflare R2 Client initialized successfully.")
+
     async def setup_hook(self):
         await self.load_extension("bot.cogs.radio")
         await self.load_extension("bot.cogs.music")
@@ -55,7 +71,7 @@ class GengarDJ(commands.Bot):
         logger.info("  Gengar DJ is online!")
         logger.info(f"  User:       {self.user} (ID: {self.user.id})")
         logger.info(f"  Guilds:     {len(self.guilds)}")
-        logger.info(f"  Songs dir:  {self.config.songs_dir}")
+        logger.info(f"  R2 Bucket:  {self.config.r2_bucket_name}")
         logger.info("═══════════════════════════════════")
 
         # Start the internal HTTP API for song creation callbacks
