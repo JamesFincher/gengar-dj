@@ -45,41 +45,23 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: gengar-claw-01
 
-      # ── Tailscale sidecar container ────────────────────────
-      initContainers:
-        - name: ts-init
-          image: tailscale/tailscale:latest
-          command: ["sh", "-c", "exit 0"]
-          securityContext:
-            capabilities:
-              add: ["NET_ADMIN", "NET_RAW"]
-            privileged: true
-
       containers:
         - name: tailscale
-          image: tailscale/tailscale:latest
+          image: tailscale/tailscale:stable
           env:
-            - name: TS_USERSPACE
-              value: "false"
             - name: TS_AUTHKEY
               valueFrom:
                 secretKeyRef:
-                  name: tailscale-auth
-                  key: authkey
-                  optional: true
+                  name: tailscale-operator
+                  key: TS_AUTHKEY
             - name: TS_HOSTNAME
               value: "gengar-dj"
-            - name: TS_STATE_DIR
-              value: "/var/lib/tailscale"
-            - name: TS_EXTRA_ARGS
-              value: "--accept-routes --advertise-tags=tag:k3s-service"
-          volumeMounts:
-            - name: tailscale-state
-              mountPath: /var/lib/tailscale
+            - name: TS_KUBE_SECRET
+              value: "gengar-dj-state"
+            - name: TS_USERSPACE
+              value: "false"
           securityContext:
-            capabilities:
-              add: ["NET_ADMIN", "NET_RAW"]
-            privileged: false
+            privileged: true
 
         # ── Main bot container ────────────────────────────────
         - name: bot
@@ -163,5 +145,3 @@ spec:
         - name: songs
           persistentVolumeClaim:
             claimName: gengar-dj-songs-pvc
-        - name: tailscale-state
-          emptyDir: {}
