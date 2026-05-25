@@ -183,5 +183,5 @@ class RadioCog(commands.Cog):
         )
 
 
-async def setup(bot):
-    await bot.add_cog(RadioCog(bot))
+def setup(bot):
+    bot.add_cog(RadioCog(bot))

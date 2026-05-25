@@ -35,6 +35,7 @@ class GengarDJ(commands.Bot):
                 type=discord.ActivityType.listening,
                 name="📻 for silences…",
             ),
+            debug_guilds=[1491331910868406342]
         )
 
         self.config = config
@@ -47,6 +48,12 @@ class GengarDJ(commands.Bot):
         # Initialize the global Cloudflare R2 Client
         self._init_r2_client()
 
+        # Load extensions synchronously in PyCord
+        self.load_extension("bot.cogs.radio")
+        self.load_extension("bot.cogs.music")
+        self.load_extension("bot.cogs.admin")
+        logger.info("Cogs loaded successfully")
+
     def _init_r2_client(self):
         """Initialize the boto3 Cloudflare R2 client."""
         endpoint = f"https://{self.config.r2_account_id}.r2.cloudflarestorage.com"
@@ -58,12 +65,6 @@ class GengarDJ(commands.Bot):
             config=BotoConfig(signature_version="s3v4"),
         )
         logger.info("Central Cloudflare R2 Client initialized successfully.")
-
-    async def setup_hook(self):
-        await self.load_extension("bot.cogs.radio")
-        await self.load_extension("bot.cogs.music")
-        await self.load_extension("bot.cogs.admin")
-        logger.info("Cogs loaded successfully")
 
     async def on_ready(self):
         logger.info("═══════════════════════════════════")

@@ -14,6 +14,7 @@ import time
 from urllib.parse import quote
 
 import discord
+import discord.sinks
 import numpy as np
 import boto3
 from botocore.config import Config as BotoConfig
@@ -21,7 +22,7 @@ from botocore.config import Config as BotoConfig
 logger = logging.getLogger("gengar_dj.player")
 
 
-class SilenceSink(discord.AudioSink):
+class SilenceSink(discord.sinks.PCMSink):
     """Audio sink that detects voice energy in real-time.
 
     Fires callbacks when someone speaks or silence starts.
@@ -35,8 +36,9 @@ class SilenceSink(discord.AudioSink):
         self.last_voice_time = time.time()
         self._speaking = False
 
-    def write(self, data: bytes):
+    def write(self, data, user):
         """Called with PCM audio chunks. Analyze RMS energy."""
+        super().write(data, user)
         try:
             # Convert PCM s16le bytes to numpy array
             frame = np.frombuffer(data, dtype=np.int16).astype(np.float32)
@@ -112,13 +114,17 @@ class RadioState:
         self.active = True
         self.last_activity = time.time()
 
-        # Start silence detection via AudioSink
+        # Start silence detection via PCMSink
         self.sink = SilenceSink(
             on_voice_activity=self._on_voice_activity,
             on_silence=self._on_silence_start,
             threshold=0.015,
         )
-        self.vc.listen(self.sink)
+        
+        async def finished_callback(sink, *args):
+            pass
+
+        self.vc.start_recording(self.sink, finished_callback)
 
         # Load playlist from R2
         await self._load_queue()
@@ -139,7 +145,8 @@ class RadioState:
 
         if self.sink:
             try:
-                self.vc.stop_listening() if self.vc else None
+                if self.vc and hasattr(self.vc, "recording") and self.vc.recording:
+                    self.vc.stop_recording()
             except Exception:
                 pass
             self.sink = None
