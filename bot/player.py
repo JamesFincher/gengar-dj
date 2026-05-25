@@ -1,8 +1,7 @@
 """Gengar DJ — Audio player and silence detection engine.
 
-Uses discord.py's VoiceClient with AudioSink for real-time
-voice energy monitoring. Plays lofi tracks directly from
-Cloudflare R2 when the voice channel goes quiet.
+Streams lofi tracks directly from Cloudflare R2 bucket
+when the voice channel goes completely quiet.
 """
 
 import asyncio
@@ -12,7 +11,6 @@ import math
 import os
 import random
 import time
-from pathlib import Path
 from urllib.parse import quote
 
 import discord
@@ -30,6 +28,7 @@ class SilenceSink(discord.AudioSink):
     """
 
     def __init__(self, on_voice_activity=None, on_silence=None, threshold=0.015):
+        super().__init__()
         self.on_voice_activity = on_voice_activity
         self.on_silence = on_silence
         self.threshold = threshold
@@ -156,16 +155,16 @@ class RadioState:
         if self.active:
             await self.stop_radio()
             return False
-        return self.active  # call start_radio separately
+        return self.active
 
     async def queue_song(self, file_key: str, title: str):
-        """Queue a new song immediately (for /create responses)."""
+        """Queue a new song immediately (for /create or /dj-spinup responses)."""
         entry = {
             "file": file_key,
             "title": title,
             "source": "suno_fresh"
         }
-        self.queue.insert(0, entry)  # Insert at front of queue to play next!
+        self.queue.insert(0, entry)  # Insert at the front to play next
         if not self.playing and self.vc and self.vc.is_connected():
             await self._play_next()
 
@@ -181,12 +180,11 @@ class RadioState:
         await asyncio.to_thread(self._load_queue_sync)
 
     def _load_queue_sync(self):
-        """Synchronous part of queue loading (run in thread to prevent blocking)."""
+        """Synchronous part of queue loading (run in thread)."""
         logger.info("Syncing lofi library from Cloudflare R2 bucket: %s", self.bot.config.r2_bucket_name)
         entries = []
         playlist_data = []
 
-        # 1. Attempt to load playlist.json from R2
         try:
             res = self.s3_client.get_object(
                 Bucket=self.bot.config.r2_bucket_name,
@@ -199,21 +197,18 @@ class RadioState:
         except Exception as e:
             logger.warning("Error reading playlist.json from R2: %s", e)
 
-        # Build lookup table for metadata from playlist_data list
         metadata_map = {}
         for item in playlist_data:
             key = item.get("file") or item.get("key")
             if key:
                 metadata_map[key] = item
 
-        # 2. Scan all audio files in the bucket
         try:
             paginator = self.s3_client.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=self.bot.config.r2_bucket_name):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     if key.lower().endswith((".mp3", ".ogg", ".wav", ".flac")) and key != "playlist.json":
-                        # Match with metadata if present
                         meta = metadata_map.get(key) or {}
                         title = meta.get("title") or os.path.splitext(os.path.basename(key))[0]
                         style_tags = meta.get("style_tags") or meta.get("tags") or ""
@@ -228,7 +223,6 @@ class RadioState:
         except Exception as e:
             logger.error("Failed to list objects in Cloudflare R2: %s", e)
 
-        # Apply genre filter if active
         if self.genre_filter:
             filtered = []
             for e in entries:
@@ -282,7 +276,7 @@ class RadioState:
 
     async def _on_silence_start(self):
         """Called when silence begins after speaking stopped."""
-        pass  # handled by the main loop
+        pass
 
     async def _play_next(self):
         """Play the next song from the queue."""
@@ -302,13 +296,12 @@ class RadioState:
         self.current_song = entry
         key = entry["file"]
 
-        # 3. Generate streaming URL
+        # Generate streaming URL
         try:
             if self.bot.config.r2_public_url:
                 encoded_key = quote(key)
                 play_url = f"{self.bot.config.r2_public_url}/{encoded_key}"
             else:
-                # Generate a secure pre-signed URL valid for 1 hour
                 play_url = await asyncio.to_thread(
                     self.s3_client.generate_presigned_url,
                     "get_object",
@@ -331,7 +324,6 @@ class RadioState:
             def after_playing(error):
                 if error:
                     logger.error("Playback error: %s", error)
-                # Schedule next track
                 coro = self._on_track_end()
                 asyncio.run_coroutine_threadsafe(coro, asyncio.get_event_loop())
 
@@ -346,9 +338,10 @@ class RadioState:
         """Called when a track finishes playing."""
         self.current_song = None
         if self.active and self.vc and self.vc.is_connected():
-            # Check if voice activity happened during playback
             silence_duration = time.time() - self.last_activity
             if silence_duration >= 2:
                 await self._play_next()
             else:
                 self.playing = False
+        else:
+            self.playing = False

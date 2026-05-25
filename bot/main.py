@@ -63,8 +63,7 @@ class GengarDJ(commands.Bot):
         await self.load_extension("bot.cogs.radio")
         await self.load_extension("bot.cogs.music")
         await self.load_extension("bot.cogs.admin")
-        await self.tree.sync()
-        logger.info("Slash commands synced")
+        logger.info("Cogs loaded successfully")
 
     async def on_ready(self):
         logger.info("═══════════════════════════════════")

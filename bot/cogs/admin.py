@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 import discord
-from discord import app_commands
+from discord import slash_command
 from discord.ext import commands
 
 logger = logging.getLogger("gengar_dj.cogs.admin")
@@ -20,31 +20,32 @@ class AdminCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(
+    @slash_command(
         name="reload",
-        description="Reload the song library from disk (admin only)",
+        description="Reload the song library from Cloudflare R2 (admin only)",
     )
-    @app_commands.default_permissions(administrator=True)
-    async def admin_reload(self, interaction: discord.Interaction):
-        """Reload the playlist from disk."""
-        guild_id = interaction.guild_id
+    @commands.has_permissions(administrator=True)
+    async def admin_reload(self, ctx: discord.ApplicationContext):
+        """Reload the playlist from R2."""
+        guild_id = ctx.guild_id
         state = self.bot.radio_states.get(guild_id)
         if state:
-            state._load_queue()
-            await interaction.response.send_message(
+            await ctx.defer()
+            await state._load_queue()
+            await ctx.respond(
                 f"🔄 Reloaded playlist — {len(state.queue)} songs in rotation."
             )
         else:
-            await interaction.response.send_message(
+            await ctx.respond(
                 "||No active radio session. Start one with /play first.||",
                 ephemeral=True,
             )
 
-    @app_commands.command(
+    @slash_command(
         name="info",
         description="Show bot technical info",
     )
-    async def admin_info(self, interaction: discord.Interaction):
+    async def admin_info(self, ctx: discord.ApplicationContext):
         """Display bot and server information."""
         embed = discord.Embed(
             title="Gengar DJ — System Info",
@@ -52,18 +53,11 @@ class AdminCog(commands.Cog):
         )
         embed.add_field(name="Guilds", value=str(len(self.bot.guilds)), inline=True)
         embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
-        embed.add_field(name="Songs Dir", value=f"`{self.bot.config.songs_dir}`", inline=False)
+        embed.add_field(name="R2 Bucket", value=f"`{self.bot.config.r2_bucket_name}`", inline=False)
         embed.add_field(name="Silence Threshold", value=f"{self.bot.config.silence_threshold}s", inline=True)
         embed.add_field(name="API Port", value=str(self.bot.config.bot_api_port), inline=True)
 
-        # Count songs
-        songs_dir = Path(self.bot.config.songs_dir)
-        song_count = 0
-        if songs_dir.exists():
-            song_count = sum(1 for f in songs_dir.iterdir() if f.suffix.lower() in (".mp3", ".ogg", ".wav", ".flac"))
-        embed.add_field(name="Local Songs", value=str(song_count), inline=True)
-
-        await interaction.response.send_message(embed=embed)
+        await ctx.respond(embed=embed)
 
 
 async def setup(bot):

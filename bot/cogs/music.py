@@ -1,4 +1,4 @@
-"""Gengar DJ — Music creation commands (/create).
+"""Gengar DJ — Music creation commands (/create and /dj-spinup).
 
 Routes song creation requests through Hermes webhook, which triggers
 Gengar to generate a Suno lofi track. The result is delivered back
@@ -12,7 +12,7 @@ import uuid
 
 import aiohttp
 import discord
-from discord import app_commands
+from discord import slash_command, option
 from discord.ext import commands
 
 logger = logging.getLogger("gengar_dj.cogs.music")
@@ -46,37 +46,33 @@ STYLE_PRESETS = {
 
 
 class MusicCog(commands.Cog):
-    """Handles /create for Suno song generation."""
+    """Handles /create and /dj-spinup for Suno song generation."""
 
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(
+    @slash_command(
         name="create",
         description="Generate a new lofi track via Suno AI and optionally play it",
     )
-    @app_commands.describe(
-        prompt="Describe the vibe/inspiration for this lofi track",
-        style="Style preset or custom description (rainy_lofi, jazzhop, citypop, chill_ambient, or custom)",
-        title="Title for the new track (optional)",
-        play="Whether to play in voice channel after creation (default: true)",
+    @option("prompt", description="Describe the vibe/inspiration for this lofi track")
+    @option(
+        "style",
+        description="Style preset or custom description",
+        choices=["rainy_lofi", "jazzhop", "citypop", "chill_ambient", "custom"],
+        default="rainy_lofi"
     )
-    @app_commands.choices(style=[
-        app_commands.Choice(name="🌧 Rainy Lofi", value="rainy_lofi"),
-        app_commands.Choice(name="🎷 Jazzhop", value="jazzhop"),
-        app_commands.Choice(name="🌃 City Pop", value="citypop"),
-        app_commands.Choice(name="🧘 Chill Ambient", value="chill_ambient"),
-        app_commands.Choice(name="✍️ Custom (prompt)", value="custom"),
-    ])
+    @option("title", description="Title for the new track (optional)", default="")
+    @option("play", description="Whether to play in voice channel after creation", default=True)
     async def create_song(
         self,
-        interaction: discord.Interaction,
+        ctx: discord.ApplicationContext,
         prompt: str,
         style: str = "rainy_lofi",
-        title: str | None = None,
+        title: str = "",
         play: bool = True,
     ):
-        await interaction.response.defer(ephemeral=True)
+        await ctx.defer(ephemeral=True)
 
         # Build the style description
         if style == "custom":
@@ -95,15 +91,15 @@ class MusicCog(commands.Cog):
             "style_tags": style_desc,
             "title": track_title,
             "callback_url": callback_url,
-            "guild_id": interaction.guild_id,
-            "channel_id": interaction.channel_id,
-            "user_id": interaction.user.id,
+            "guild_id": ctx.guild_id,
+            "channel_id": ctx.channel_id,
+            "user_id": ctx.author.id,
             "play_in_vc": play,
         }
 
         logger.info(
             "User %s requested /create: '%s' (style: %s)",
-            interaction.user, prompt, style,
+            ctx.author, prompt, style,
         )
 
         # Send initial acknowledgment
@@ -112,12 +108,12 @@ class MusicCog(commands.Cog):
             description=(
                 f"**{track_title}**\n\n"
                 f"*{prompt[:200]}*\n\n"
-                "⏳ Sending to Hermes for Suno generation…\n"
+                "⏳ Sending to Gengar's Shadow Gateway for Suno generation…\n"
                 "This usually takes 1-2 minutes."
             ),
             color=0x9B59B6,
         )
-        await interaction.followup.send(embed=embed, ephemeral=False)
+        await ctx.respond(embed=embed)
 
         # POST to the Hermes webhook
         try:
@@ -145,24 +141,53 @@ class MusicCog(commands.Cog):
                         logger.error(
                             "Hermes webhook returned %d: %s", resp.status, body
                         )
-                        await interaction.followup.send(
+                        await ctx.respond(
                             "||Failed to queue song creation. Gengar's webhook returned an error.||",
                             ephemeral=True,
                         )
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error("Hermes webhook connection error: %s", e)
-            await interaction.followup.send(
-                "||Couldn't reach Hermes. Please try again later.||",
+            await ctx.respond(
+                "||Couldn't reach Gengar. Please try again later.||",
                 ephemeral=True,
             )
 
+    @slash_command(
+        name="dj-spinup",
+        description="Spin up a custom Suno track securely through Gengar's shadow gateway!",
+    )
+    @option("prompt", description="The theme, topic, or lyrics for the song (e.g. 'a song about potatoes')")
+    @option(
+        "style",
+        description="Select a preset genre or choose custom",
+        choices=["rainy_lofi", "jazzhop", "citypop", "chill_ambient", "custom"],
+        default="rainy_lofi"
+    )
+    @option("title", description="Custom title for the track", default="")
+    async def dj_spinup(
+        self,
+        ctx: discord.ApplicationContext,
+        prompt: str,
+        style: str = "rainy_lofi",
+        title: str = "",
+    ):
+        """Securely dispatch a song generation request directly to Gengar."""
+        # Delegates directly to create_song with autoplay enabled (play=True)
+        await self.create_song(
+            ctx=ctx,
+            prompt=prompt,
+            style=style,
+            title=title,
+            play=True
+        )
+
     # ─── /playlist commands ──────────────────────────────────────
 
-    @app_commands.command(
+    @slash_command(
         name="playlist",
         description="Show the current song playlist",
     )
-    async def show_playlist(self, interaction: discord.Interaction):
+    async def show_playlist(self, ctx: discord.ApplicationContext):
         import json
         try:
             res = await asyncio.to_thread(
@@ -175,14 +200,14 @@ class MusicCog(commands.Cog):
             entries = []
         except Exception as e:
             logger.error("Failed to load R2 playlist: %s", e)
-            await interaction.response.send_message(
+            await ctx.respond(
                 "||Failed to load playlist from Cloudflare R2.||", ephemeral=True
             )
             return
 
         if not entries:
-            await interaction.response.send_message(
-                "||The playlist is empty. Use /create to make some songs!||",
+            await ctx.respond(
+                "||The playlist is empty. Use /dj-spinup to make some songs!||",
                 ephemeral=True,
             )
             return
@@ -203,9 +228,9 @@ class MusicCog(commands.Cog):
         if total > 15:
             embed.set_footer(text=f"Showing 15 of {total} songs")
         else:
-            embed.set_footer(text="Use /create to add more!")
+            embed.set_footer(text="Use /dj-spinup to add more!")
 
-        await interaction.response.send_message(embed=embed)
+        await ctx.respond(embed=embed)
 
 
 async def setup(bot):
