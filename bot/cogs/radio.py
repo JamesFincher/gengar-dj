@@ -60,17 +60,25 @@ class RadioCog(commands.Cog):
 
         success = await state.start_radio(channel)
         if success:
+            mode_desc = ""
+            if not state.recording_available:
+                mode_desc = (
+                    f"\\n⚠️ Voice detection unavailable (DAVE E2EE). "
+                    f"Music starts after **{state.bot.config.silence_threshold}s** timer, "
+                    f"then plays continuously."
+                )
             embed = discord.Embed(
                 title="📻 Gengar DJ — Radio On",
                 description=(
-                    f"Now listening for silence in **{channel.name}**\n"
-                    f"Threshold: `{state.bot.config.silence_threshold}s` of silence\n"
-                    f"Genre: `{state.genre_filter or 'all'}`\n"
+                    f"Now listening for silence in **{channel.name}**\\n"
+                    f"Threshold: `{state.bot.config.silence_threshold}s` of silence\\n"
+                    f"Genre: `{state.genre_filter or 'all'}`\\n"
                     f"Songs loaded from R2: `{len(state.queue)}`"
+                    f"{mode_desc}"
                 ),
                 color=0x9B59B6,
             )
-            embed.set_footer(text="Talk and the music fades • Radio resumes when quiet")
+            embed.set_footer(text="Talk and the music ducks • Radio resumes when quiet")
             await ctx.respond(embed=embed)
         else:
             await ctx.respond(
@@ -181,6 +189,55 @@ class RadioCog(commands.Cog):
         await ctx.respond(
             f"🎵 Genre filter set to `{genre}`. {len(state.queue)} songs in rotation.",
         )
+
+    # ─── /ducking ─────────────────────────────────────────────────
+
+    @slash_command(name="ducking", description="Configure voice-activated volume ducking (fades when people talk)")
+    @option("enabled", description="Enable or disable ducking", choices=["on", "off"], required=False)
+    @option("level", description="Volume while people talk (5-50%)", type=int, min_value=5, max_value=50, required=False)
+    @option("fade", description="Seconds to fade back to full volume (1-15)", type=int, min_value=1, max_value=15, required=False)
+    async def radio_ducking(
+        self,
+        ctx: discord.ApplicationContext,
+        enabled: str = None,
+        level: int = None,
+        fade: int = None,
+    ):
+        state = self._get_state(ctx.guild_id)
+        changed = []
+
+        if enabled is not None:
+            state.ducking_enabled = (enabled == "on")
+            changed.append(f"Ducking: `{'ON' if state.ducking_enabled else 'OFF'}`")
+
+        if level is not None:
+            state.duck_volume = level / 100.0
+            changed.append(f"Duck volume: `{level}%`")
+
+        if fade is not None:
+            state.fade_back_seconds = float(fade)
+            changed.append(f"Fade-back: `{fade}s`")
+
+        if not changed:
+            # Show current settings
+            changed = [
+                f"Ducking: `{'ON' if state.ducking_enabled else 'OFF'}`",
+                f"Duck volume: `{int(state.duck_volume * 100)}%`",
+                f"Fade-back: `{int(state.fade_back_seconds)}s`",
+            ]
+
+        note = (
+            "\n\n⚠️ Voice detection is currently unavailable due to Discord's "
+            "DAVE E2EE protocol. Ducking settings are saved and will activate "
+            "automatically when py-cord ships DAVE receive support."
+        ) if not state.recording_available else ""
+
+        embed = discord.Embed(
+            title="🔇 Gengar DJ — Ducking",
+            description="\n".join(f"• {c}" for c in changed) + note,
+            color=0x9B59B6,
+        )
+        await ctx.respond(embed=embed)
 
 
 def setup(bot):

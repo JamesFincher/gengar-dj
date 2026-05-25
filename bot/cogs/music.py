@@ -134,8 +134,8 @@ class MusicCog(commands.Cog):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
-                    if resp.status == 200:
-                        logger.info("Hermes webhook accepted /create request")
+                    if resp.status in (200, 202):
+                        logger.info("Hermes webhook accepted /create request (status %d)", resp.status)
                     else:
                         body = await resp.text()
                         logger.error(

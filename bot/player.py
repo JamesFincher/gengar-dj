@@ -26,7 +26,17 @@ class SilenceSink(discord.sinks.PCMSink):
     """Audio sink that detects voice energy in real-time.
 
     Fires callbacks when someone speaks or silence starts.
+    
+    Note: Voice reception is currently broken in py-cord 2.8.0 
+    due to Discord's DAVE E2EE protocol. This sink is kept for when 
+    py-cord fixes receiving support (track: github.com/Pycord-Development/pycord/issues/3139).
     """
+
+    __sink_listeners__ = []  # Required by py-cord 2.8.0 SinkEventRouter
+
+    def walk_children(self):
+        """Return child sinks (none for this simple sink)."""
+        return []
 
     def __init__(self, on_voice_activity=None, on_silence=None, threshold=0.015):
         super().__init__()
@@ -93,9 +103,19 @@ class RadioState:
         self.silence_start: float | None = None
         self.last_activity: float = time.time()
         self._radio_task: asyncio.Task | None = None
+        self.recording_available: bool = True  # False when DAVE E2EE blocks receiving
 
         # Volume (0.0 - 2.0)
         self.volume: float = 0.6
+
+        # Ducking (voice-activated volume fade)
+        # NOTE: Requires DAVE receive support (py-cord PR #3139).
+        # Settings are wired up and will activate automatically
+        # when py-cord ships DAVE voice reception.
+        self.ducking_enabled: bool = True
+        self.duck_volume: float = 0.12     # volume when people talk (12%)
+        self.fade_back_seconds: float = 4.0  # seconds to ramp back to full volume
+        self._fade_task: asyncio.Task | None = None
 
         # Cloudflare R2 client
         self.s3_client = bot.s3_client
@@ -124,7 +144,19 @@ class RadioState:
         async def finished_callback(sink, *args):
             pass
 
-        self.vc.start_recording(self.sink, finished_callback)
+        # Try to start voice receiving for silence detection.
+        # Falls back to immediate-playback mode if DAVE E2EE blocks reception.
+        self.recording_available = True
+        try:
+            self.vc.start_recording(self.sink, finished_callback)
+        except Exception as e:
+            logger.warning(
+                "Voice reception unavailable (DAVE E2EE blocks receiving): %s. "
+                "Falling back to auto-play mode — music starts immediately.",
+                e
+            )
+            self.recording_available = False
+            self.sink = None
 
         # Load playlist from R2
         await self._load_queue()
@@ -249,7 +281,30 @@ class RadioState:
         )
 
     async def _radio_loop(self):
-        """Main loop: monitor silence threshold and play/pause."""
+        """Main loop: monitor silence threshold and play/pause.
+        
+        When DAVE E2EE blocks voice reception, falls back to 
+        immediate autoplay — music starts the moment /play is used.
+        """
+        # If voice receiving is broken (DAVE E2EE), use timer-based wait
+        # instead of silence detection. Music starts after threshold, then
+        # plays continuously once begun.
+        if not self.recording_available:
+            threshold = self.bot.config.silence_threshold
+            logger.info(
+                "Guild %d: Voice reception unavailable — timer mode "
+                "(music starts in %ds, then continuous)",
+                self.guild_id, threshold,
+            )
+            # Wait for the configured threshold before starting
+            while self.active and not self.playing:
+                elapsed = time.time() - self.last_activity
+                if elapsed >= threshold and self.vc and self.vc.is_connected():
+                    await self._play_next()
+                    break
+                await asyncio.sleep(1)
+            # After first track starts, fall through to continuous loop
+
         while self.active:
             try:
                 if not self.playing:
@@ -273,13 +328,38 @@ class RadioState:
                 await asyncio.sleep(5)
 
     async def _on_voice_activity(self):
-        """Called when someone speaks in VC. Stop music immediately."""
+        """Called when someone speaks in VC. Duck music to low volume."""
         self.last_activity = time.time()
-        if self.playing:
-            logger.info("Voice detected in guild %d — pausing radio", self.guild_id)
-            self.playing = False
-            if self.vc and self.vc.is_playing():
-                self.vc.stop()
+        if self.playing and self.ducking_enabled:
+            logger.info("Voice detected in guild %d — ducking to %.0f%%", 
+                       self.guild_id, self.duck_volume * 100)
+            if self.vc and self.vc.source:
+                self.vc.source.volume = self.duck_volume
+            # Cancel any pending fade-back and start a new one
+            if self._fade_task and not self._fade_task.done():
+                self._fade_task.cancel()
+            self._fade_task = asyncio.create_task(self._fade_back_up())
+
+    async def _fade_back_up(self):
+        """Gradually ramp volume from duck level back to full over fade_back_seconds."""
+        try:
+            await asyncio.sleep(1.5)  # brief hold at duck level
+            steps = 20
+            delay = self.fade_back_seconds / steps
+            vol_delta = (self.volume - self.duck_volume) / steps
+            for i in range(1, steps + 1):
+                if not self.playing or not self.vc or not self.vc.source:
+                    return
+                target = self.duck_volume + (vol_delta * i)
+                self.vc.source.volume = min(target, self.volume)
+                await asyncio.sleep(delay)
+            # Ensure we land exactly on target
+            if self.vc and self.vc.source:
+                self.vc.source.volume = self.volume
+        except asyncio.CancelledError:
+            pass  # cancelled because someone spoke again — restart the timer
+        except Exception as e:
+            logger.warning("Fade-back error: %s", e)
 
     async def _on_silence_start(self):
         """Called when silence begins after speaking stopped."""
@@ -323,7 +403,7 @@ class RadioState:
         try:
             source = discord.FFmpegPCMAudio(
                 play_url,
-                options="-filter:a loudnorm",
+                options="-filter:a afade=t=in:d=3,loudnorm",
                 before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             )
             volume_source = discord.PCMVolumeTransformer(source, volume=self.volume)
