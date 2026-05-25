@@ -72,7 +72,7 @@ class MusicCog(commands.Cog):
         title: str = "",
         play: bool = True,
     ):
-        await ctx.defer(ephemeral=True)
+        await ctx.defer()  # non-ephemeral so we can edit later
 
         # Build the style description
         if style == "custom":
@@ -102,18 +102,30 @@ class MusicCog(commands.Cog):
             ctx.author, prompt, style,
         )
 
-        # Send initial acknowledgment
-        embed = discord.Embed(
-            title="🎵 Generating…",
+        # Send progress embed — we'll edit this when the callback arrives
+        progress_embed = discord.Embed(
+            title="🎵 Gengar DJ — Spin Up",
             description=(
                 f"**{track_title}**\n\n"
-                f"*{prompt[:200]}*\n\n"
-                "⏳ Sending to Gengar's Shadow Gateway for Suno generation…\n"
-                "This usually takes 1-2 minutes."
+                f"*{prompt[:200]}{'…' if len(prompt) > 200 else ''}*\n\n"
+                f"🔄 Dispatching to Suno…\n"
+                f"⬜ Composing track\n"
+                f"⬜ Uploading to R2\n"
+                f"⬜ Ready to play"
             ),
             color=0x9B59B6,
         )
-        await ctx.respond(embed=embed)
+        progress_embed.set_footer(text="Gengar's Shadow Gateway • v5.5")
+
+        # Send the response and capture the message for later editing
+        response_msg = await ctx.respond(embed=progress_embed)
+        # Get the actual Discord message to extract its ID
+        try:
+            original = await ctx.interaction.original_response()
+            webhook_payload["response_channel_id"] = ctx.channel_id
+            webhook_payload["response_message_id"] = original.id
+        except Exception:
+            pass  # best-effort; callback will fall back to new message
 
         # POST to the Hermes webhook
         try:
@@ -134,13 +146,11 @@ class MusicCog(commands.Cog):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
+                    body = await resp.text()
                     if resp.status in (200, 202):
                         logger.info("Hermes webhook accepted /create request (status %d)", resp.status)
                     else:
-                        body = await resp.text()
-                        logger.error(
-                            "Hermes webhook returned %d: %s", resp.status, body
-                        )
+                        logger.error("Hermes webhook returned %d: %s", resp.status, body)
                         await ctx.respond(
                             "||Failed to queue song creation. Gengar's webhook returned an error.||",
                             ephemeral=True,

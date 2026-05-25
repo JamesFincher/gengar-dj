@@ -75,7 +75,11 @@ class APIServer:
             "title": str,
             "file_key": str,         // R2 object key of the uploaded song
             "play_in_vc": bool,
-            "style_tags": str (optional)
+            "style_tags": str (optional),
+            "suno_url": str (optional),        // Suno clip page URL
+            "suno_clip_id": str (optional),    // Suno clip ID
+            "response_channel_id": int (optional),  // to edit the progress embed
+            "response_message_id": int (optional),
         }
         """
         try:
@@ -89,6 +93,10 @@ class APIServer:
         file_key = data.get("file_key")
         play_in_vc = data.get("play_in_vc", False)
         style_tags = data.get("style_tags", "")
+        suno_url = data.get("suno_url", "")
+        suno_clip_id = data.get("suno_clip_id", "")
+        response_channel_id = data.get("response_channel_id")
+        response_message_id = data.get("response_message_id")
 
         if not guild_id or not channel_id or not file_key:
             return web.json_response(
@@ -105,17 +113,50 @@ class APIServer:
             "file": file_key,
             "style_tags": style_tags,
             "source": "suno",
+            "suno_url": suno_url,
+            "suno_clip_id": suno_clip_id,
             "created_at": asyncio.get_event_loop().time(),
         }
         await asyncio.to_thread(self._append_to_r2_playlist_sync, entry)
 
-        # Send notification to Discord channel
+        # Update the original progress embed if we have the message reference
         guild = self.bot.get_guild(guild_id)
         channel = guild.get_channel(channel_id) if guild else None
+        
+        if channel and response_message_id:
+            try:
+                msg = await channel.fetch_message(response_message_id)
+            except Exception:
+                msg = None
+            
+            if msg:
+                # Edit the progress embed to show completion
+                suno_link = f"\n🔗 [Open on Suno]({suno_url})" if suno_url else ""
+                ready_embed = discord.Embed(
+                    title="🎵 Gengar DJ — Track Ready!",
+                    description=(
+                        f"**{title}**\n\n"
+                        f"✅ Dispatched to Suno\n"
+                        f"✅ Composed & rendered\n"
+                        f"✅ Uploaded to R2\n"
+                        f"✅ Ready to play{suno_link}"
+                    ),
+                    color=0x2ECC71,
+                )
+                if suno_clip_id:
+                    ready_embed.set_footer(text=f"Suno Clip: {suno_clip_id}")
+                await msg.edit(embed=ready_embed)
+
+        # Send notification with play options to Discord channel
         if channel:
+            suno_link = f"\n🔗 [Open on Suno]({suno_url})" if suno_url else ""
             embed = discord.Embed(
-                title="🎵 New Song Created!",
-                description=f"**{title}**",
+                title="🎵 New Track Created!",
+                description=(
+                    f"**{title}**{suno_link}\n"
+                    f"Use `/play` to start the radio or the "
+                    f"track will auto-play if radio is active."
+                ),
                 color=0x9B59B6,
             )
             if style_tags:

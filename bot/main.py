@@ -33,7 +33,7 @@ class GengarDJ(commands.Bot):
             intents=intents,
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
-                name="📻 for silences…",
+                name="⏳ for the timer…",
             ),
             debug_guilds=[1491331910868406342]
         )
